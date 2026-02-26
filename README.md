@@ -70,6 +70,9 @@ Look for the Bitwarden extension ID (usually `nngceckbapebfimnlniiiahkandclblb` 
 | Chrome | Linux | `~/.config/google-chrome/Default/Local Extension Settings/nngceckbapebfimnlniiiahkandclblb` |
 | Firefox | Windows | `%AppData%\Mozilla\Firefox\Profiles\[your-profile]\storage\default\moz-extension+++[UUID]` |
 | Edge | Windows | `%LocalAppData%\Microsoft\Edge\User Data\Default\Local Extension Settings\jbkfoedolllekgbhcbcoahefnbanhhlh` |
+| Brave | Windows | `%LocalAppData%\BraveSoftware\Brave-Browser\User Data\Default\Local Extension Settings\nngceckbapebfimnlniiiahkandclblb` |
+| Brave | macOS | `~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Local Extension Settings/nngceckbapebfimnlniiiahkandclblb` |
+| Brave | Linux | `~/.config/BraveSoftware/Brave-Browser/Default/Local Extension Settings/nngceckbapebfimnlniiiahkandclblb` |
 
 Inside that folder you'll see LevelDB files like `000003.log`, `CURRENT`, `MANIFEST-000001` — not a `data.json`.
 
