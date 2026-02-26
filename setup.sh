@@ -57,20 +57,6 @@ echo "Installing core dependencies..."
 "${VENV_DIR}/bin/pip" install --upgrade pip --quiet
 "${VENV_DIR}/bin/pip" install -r requirements.txt --quiet
 
-# ── Try to install plyvel (optional, for browser vault extraction) ───────
-echo ""
-echo "Installing plyvel (optional — needed for extract_browser_vault.py)..."
-if "${VENV_DIR}/bin/pip" install plyvel --quiet 2>/dev/null; then
-    echo "  plyvel installed successfully."
-else
-    echo "  WARNING: plyvel failed to install. This is only needed if you want to"
-    echo "  extract vault data from a browser extension's LevelDB storage."
-    echo "  It requires the LevelDB C library headers to compile:"
-    echo "    Debian/Ubuntu:  sudo apt install libleveldb-dev"
-    echo "    RHEL/Fedora:    sudo dnf install leveldb-devel"
-    echo "  Then re-run: ${VENV_DIR}/bin/pip install plyvel"
-fi
-
 echo ""
 echo "Done. Activate the venv with:"
 echo "  source ${VENV_DIR}/bin/activate"

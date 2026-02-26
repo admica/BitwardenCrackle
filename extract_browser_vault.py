@@ -1,108 +1,195 @@
-#!/usr/bin/env python3
+#!./venv/bin/python3
 """Extract Bitwarden vault data from browser extension LevelDB storage into a data.json
-compatible with BitwardenDecrypt.py and brute.py.
+compatible with brute.py.
+
+The browser extension stores vault data across multiple LevelDB entries with keys like:
+    user_<UUID>_kdfConfig_           -> {"kdfType": 0, "iterations": 100000}
+    user_<UUID>_crypto_account...    -> {"V1": {"private_key": "2.xxx|yyy|zzz"}}
+    masterPasswordUnlock_...         -> {"salt": "email", ..., "masterKeyWrappedUserKey": "2.xxx|yyy|zzz"}
+    loginEmail_storedEmail           -> "user@example.com"
+
+This script scans the raw .log and .ldb files, extracts these values, and writes a
+data.json that brute.py can use for password testing.
 
 Usage:
     python3 extract_browser_vault.py /path/to/leveldb/folder
     python3 extract_browser_vault.py /path/to/leveldb/folder -o my_vault.json
+    python3 extract_browser_vault.py /path/to/leveldb/folder --dump-raw
 
-The LevelDB folder is the extension's local storage directory containing files like
-000003.log, CURRENT, MANIFEST-000001, etc. See README.md for paths per browser/OS.
-
-Requires: pip install plyvel
+No extra dependencies required.
 """
 
 import argparse
+import glob
 import json
+import os
+import re
 import sys
 
-try:
-    import plyvel
-except ModuleNotFoundError:
-    print("This script requires the 'plyvel' package.")
-    print("Install it with: pip install plyvel")
-    sys.exit(1)
 
+def read_leveldb_raw(db_path):
+    """Read all .log and .ldb files into a single byte string."""
+    target_files = []
+    for ext in ("*.log", "*.ldb"):
+        target_files.extend(glob.glob(os.path.join(db_path, ext)))
 
-# Keys that BitwardenDecrypt.py / brute.py expect at the top level of data.json
-REQUIRED_KEYS = {"userEmail", "kdfIterations", "encKey", "encPrivateKey"}
-OPTIONAL_KEYS = {"userId", "encOrgKeys"}
-# Prefixes for vault collection data
-COLLECTION_PREFIXES = ("folders_", "ciphers_", "organizations_", "collections_", "sends_")
-
-
-def extract_from_leveldb(db_path):
-    """Read all key-value pairs from a LevelDB database."""
-    try:
-        db = plyvel.DB(db_path, create_if_missing=False)
-    except Exception as e:
-        print(f"ERROR: Could not open LevelDB at {db_path}: {e}", file=sys.stderr)
+    if not target_files:
+        print(f"ERROR: No .log or .ldb files found in {db_path}", file=sys.stderr)
         sys.exit(1)
 
-    entries = {}
-    for raw_key, raw_value in db:
+    raw = b""
+    for filepath in sorted(target_files):
         try:
-            key = raw_key.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
+            with open(filepath, "rb") as f:
+                raw += f.read()
+        except OSError as e:
+            print(f"  Warning: could not read {filepath}: {e}", file=sys.stderr)
 
-        try:
-            value = json.loads(raw_value.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            # Store raw string if it's not JSON
-            try:
-                value = raw_value.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-
-        entries[key] = value
-
-    db.close()
-    return entries
+    return raw
 
 
-def build_data_json(entries):
-    """Map LevelDB entries to a data.json-compatible dict.
+def extract_json_values(text):
+    """Find all {"__json__":true,"value":"..."} blocks and return their parsed inner values.
 
-    The browser extension may store keys directly (e.g. "userEmail") or
-    nested inside a wrapper. This function handles both cases.
+    Returns list of (preceding_context, parsed_value) tuples.
     """
-    data = {}
+    results = []
+    prefix = '{"__json__":true,"value":"'
+    idx = 0
 
-    # Check if entries are already in the expected flat format
-    if any(k in entries for k in REQUIRED_KEYS):
-        data = entries
-    else:
-        # Some versions nest data under a user ID key or other wrapper.
-        # Try to find required keys anywhere in the values.
-        for key, value in entries.items():
-            if isinstance(value, dict):
-                if any(k in value for k in REQUIRED_KEYS):
-                    # Found a nested dict containing vault keys — merge it up
-                    data.update(value)
-                    break
+    while True:
+        start = text.find(prefix, idx)
+        if start < 0:
+            break
 
-        # If still not found, flatten all dict values as a last resort
-        if not any(k in data for k in REQUIRED_KEYS):
-            for key, value in entries.items():
-                if isinstance(value, str) or isinstance(value, (int, float)):
-                    data[key] = value
-                elif isinstance(value, dict):
-                    data.update(value)
+        val_start = start + len(prefix)
 
-    return data
+        # Walk to find the closing unescaped quote
+        i = val_start
+        while i < len(text) - 1:
+            if text[i] == '\\':
+                i += 2
+            elif text[i] == '"':
+                break
+            else:
+                i += 1
+
+        json_end = i + 2  # include "}
+        raw_block = text[start:json_end]
+
+        try:
+            parsed = json.loads(raw_block)
+            inner_raw = parsed["value"]
+            try:
+                inner = json.loads(inner_raw)
+            except (json.JSONDecodeError, TypeError):
+                inner = inner_raw
+
+            # Get preceding context to identify the key
+            ctx_start = max(0, start - 300)
+            preceding = text[ctx_start:start]
+
+            results.append((preceding, inner))
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        idx = json_end
+
+    return results
 
 
-def validate_data(data):
-    """Check that the extracted data has the required keys for decryption."""
-    missing = REQUIRED_KEYS - set(data.keys())
+def extract_vault_data(db_path):
+    """Extract Bitwarden vault fields from browser extension LevelDB storage."""
+    raw = read_leveldb_raw(db_path)
+    text = raw.decode("utf-8", errors="replace")
+
+    entries = extract_json_values(text)
+    print(f"Found {len(entries)} JSON entries in LevelDB files", file=sys.stderr)
+
+    vault = {}
+
+    for preceding, value in entries:
+        # Clean preceding context for matching
+        ctx = re.sub(r'[^\x20-\x7e]', ' ', preceding).strip()
+
+        # --- KDF Config ---
+        if isinstance(value, dict) and "kdfType" in value and "iterations" in value:
+            vault["kdfType"] = value["kdfType"]
+            vault["kdfIterations"] = value["iterations"]
+
+        # --- Stored email ---
+        if "loginEmail_storedEmail" in ctx and isinstance(value, str) and "@" in value:
+            vault["userEmail"] = value
+
+        # --- Crypto account (private key) ---
+        if isinstance(value, dict) and "V1" in value:
+            v1 = value["V1"]
+            if isinstance(v1, dict) and "private_key" in v1:
+                vault["encPrivateKey"] = v1["private_key"]
+
+        # --- Master password unlock data (contains the user key / encKey) ---
+        if isinstance(value, dict) and "salt" in value:
+            if "salt" in value and "@" in str(value.get("salt", "")):
+                vault.setdefault("userEmail", value["salt"])
+
+            # The user key is under masterKeyWrappedUserKey (direct or nested)
+            user_key = value.get("masterKeyWrappedUserKey")
+            if not user_key:
+                # May be nested under a sub-object
+                for k, v in value.items():
+                    if isinstance(v, dict):
+                        user_key = v.get("masterKeyWrappedUserKey")
+                        if user_key:
+                            break
+            if user_key:
+                vault["encKey"] = user_key
+
+        # --- Global account (may have email) ---
+        if isinstance(value, dict) and "global_account" in ctx:
+            for uid, info in value.items():
+                if isinstance(info, dict) and "email" in info:
+                    vault.setdefault("userEmail", info["email"])
+                    vault.setdefault("userId", uid)
+
+    # The masterPasswordUnlock entry is sometimes split across binary boundaries.
+    # Fall back to regex if we didn't find encKey.
+    if "encKey" not in vault:
+        # Look for CipherString pattern near "KeyWrappedUser" text
+        pattern = re.compile(
+            r'KeyWrappedUse[a-zA-Z]*[^2]*?(2\.[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+)'
+        )
+        for m in pattern.finditer(text):
+            vault["encKey"] = m.group(1)
+            break
+
+    # Also try to find email from salt pattern
+    if "userEmail" not in vault:
+        m = re.search(r'"salt"\s*:\s*"([^"]+@[^"]+)"', text)
+        if m:
+            vault["userEmail"] = m.group(1)
+
+    # Try to find KDF iterations from raw text if not found
+    if "kdfIterations" not in vault:
+        m = re.search(r'"iterations"\s*:\s*(\d+)', text)
+        if m:
+            vault["kdfIterations"] = int(m.group(1))
+
+    # Ensure encOrgKeys exists (even if empty) for compatibility
+    vault.setdefault("encOrgKeys", {})
+
+    return vault, entries
+
+
+def validate_vault(vault):
+    """Check that required keys for brute.py are present."""
+    required = {"userEmail", "kdfIterations", "encKey", "encPrivateKey"}
+    missing = required - set(vault.keys())
     if missing:
         print(f"WARNING: Missing required keys: {', '.join(sorted(missing))}", file=sys.stderr)
-        print("The extracted data.json may not work with brute.py/BitwardenDecrypt.py.", file=sys.stderr)
         print("", file=sys.stderr)
-        print("Available keys:", file=sys.stderr)
-        for k in sorted(data.keys()):
-            v = str(data[k])
+        print("Extracted keys:", file=sys.stderr)
+        for k in sorted(vault.keys()):
+            v = str(vault[k])
             preview = v[:80] + "..." if len(v) > 80 else v
             print(f"  {k}: {preview}", file=sys.stderr)
         return False
@@ -116,27 +203,38 @@ def main():
     parser.add_argument("leveldb_path", help="Path to the LevelDB folder (extension local storage)")
     parser.add_argument("-o", "--output", default="data.json", help="Output file (default: data.json)")
     parser.add_argument("--dump-raw", action="store_true",
-                        help="Dump all raw LevelDB entries to stdout for debugging")
+                        help="Dump all extracted JSON entries to stdout for debugging")
     args = parser.parse_args()
 
     print(f"Reading LevelDB: {args.leveldb_path}", file=sys.stderr)
-    entries = extract_from_leveldb(args.leveldb_path)
-    print(f"Found {len(entries)} entries", file=sys.stderr)
+    vault, all_entries = extract_vault_data(args.leveldb_path)
 
     if args.dump_raw:
-        print(json.dumps(entries, indent=2, default=str))
+        for ctx, val in all_entries:
+            ctx_clean = re.sub(r'[^\x20-\x7e]', ' ', ctx[-100:]).strip()
+            val_str = json.dumps(val, default=str)
+            if len(val_str) > 200:
+                val_str = val_str[:200] + "..."
+            print(f"[{ctx_clean[-60:]}] -> {val_str}")
         return
 
-    data = build_data_json(entries)
-    valid = validate_data(data)
+    valid = validate_vault(vault)
 
     with open(args.output, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(vault, f, indent=2)
 
     if valid:
-        print(f"Extracted to {args.output} — ready for brute.py", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"Extracted to {args.output}:", file=sys.stderr)
+        print(f"  Email:        {vault.get('userEmail', '?')}", file=sys.stderr)
+        print(f"  KDF iters:    {vault.get('kdfIterations', '?')}", file=sys.stderr)
+        print(f"  encKey:       {str(vault.get('encKey', '?'))[:50]}...", file=sys.stderr)
+        print(f"  encPrivateKey: {str(vault.get('encPrivateKey', '?'))[:50]}...", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"Ready for brute.py:", file=sys.stderr)
+        print(f"  python3 brute.py {args.output} wordlist.txt", file=sys.stderr)
     else:
-        print(f"Wrote {args.output} anyway — inspect it manually to check the structure.", file=sys.stderr)
+        print(f"Wrote {args.output} — inspect it manually.", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!./venv/bin/python3
 """Fast parallel Bitwarden vault brute-forcer.
 
 Usage:
@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-# ── Shared globals (set before pool fork, inherited by workers) ──────────
+# ── Shared globals (set by worker initializer) ───────────────────────────
 _email = None
 _kdf_iterations = None
 _enc_key_iv = None
@@ -30,17 +30,15 @@ _enc_key_ct = None
 _enc_key_mac = None
 
 
-def init_globals(email, kdf_iterations, enc_key_cipher_string):
-    """Parse vault parameters into module globals so forked workers inherit them."""
+def _worker_init(email, kdf_iterations, enc_key_iv, enc_key_ct, enc_key_mac):
+    """Initialize globals in each worker process and ignore SIGINT."""
     global _email, _kdf_iterations, _enc_key_iv, _enc_key_ct, _enc_key_mac
-
     _email = email
     _kdf_iterations = kdf_iterations
-
-    parts = enc_key_cipher_string.split(".")[1].split("|")
-    _enc_key_iv = base64.b64decode(parts[0])
-    _enc_key_ct = base64.b64decode(parts[1])
-    _enc_key_mac = base64.b64decode(parts[2])
+    _enc_key_iv = enc_key_iv
+    _enc_key_ct = enc_key_ct
+    _enc_key_mac = enc_key_mac
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def try_password(password):
@@ -113,25 +111,32 @@ def password_stream(source):
 
 
 def do_full_decrypt(datafile, password):
-    """Run the full vault decryption and write Cleartext.json."""
-    # Import the original decryptor for the full vault dump
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import BitwardenDecrypt
+    """Run the full vault decryption and write Cleartext.json.
 
-    class Options:
-        pass
+    This only works with desktop-format data.json files that contain cipher entries.
+    For browser-extracted vaults, the password is still identified but full decryption
+    may not be possible (the browser stores ciphers differently).
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import BitwardenDecrypt
 
-    opts = Options()
-    opts.inputfile = datafile
-    opts.password = password
-    opts.includesends = False
+        class Options:
+            pass
 
-    decrypted_json = BitwardenDecrypt.decryptBitwardenJSON(opts)
-    with open("Cleartext.json", "w") as f:
-        f.write(decrypted_json)
+        opts = Options()
+        opts.inputfile = datafile
+        opts.password = password
+        opts.includesends = False
 
-    print(f"\nSUCCESS! Password: {password}")
-    print("Decrypted vault written to Cleartext.json")
+        decrypted_json = BitwardenDecrypt.decryptBitwardenJSON(opts)
+        with open("Cleartext.json", "w") as f:
+            f.write(decrypted_json)
+        print("Decrypted vault written to Cleartext.json")
+    except Exception as e:
+        print(f"Note: Could not perform full vault decryption: {e}", file=sys.stderr)
+        print("This is expected for browser-extracted vaults.", file=sys.stderr)
+        print("The password has been identified — you can use it to unlock your vault.", file=sys.stderr)
 
 
 def main():
@@ -156,7 +161,11 @@ def main():
     kdf_iterations = data["kdfIterations"]
     enc_key = data["encKey"]
 
-    init_globals(email, kdf_iterations, enc_key)
+    # Pre-parse the encKey CipherString
+    parts = enc_key.split(".")[1].split("|")
+    enc_key_iv = base64.b64decode(parts[0])
+    enc_key_ct = base64.b64decode(parts[1])
+    enc_key_mac = base64.b64decode(parts[2])
 
     print(f"Vault:      {args.datafile}", file=sys.stderr)
     print(f"Email:      {email}", file=sys.stderr)
@@ -177,9 +186,13 @@ def main():
     found = False
     start = time.time()
 
-    # Ignore SIGINT in workers so the parent can handle Ctrl+C cleanly
+    # Ignore SIGINT in parent during pool creation, then restore
     original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    pool = multiprocessing.Pool(processes=args.workers, initializer=_worker_init)
+    pool = multiprocessing.Pool(
+        processes=args.workers,
+        initializer=_worker_init,
+        initargs=(email, kdf_iterations, enc_key_iv, enc_key_ct, enc_key_mac),
+    )
     signal.signal(signal.SIGINT, original_sigint)
 
     try:
@@ -200,15 +213,24 @@ def main():
             if success:
                 print("", file=sys.stderr)
                 pool.terminate()
+                pool.join()
                 found = True
+                print(f"\nSUCCESS! Password: {password}")
                 do_full_decrypt(args.datafile, password)
                 break
 
     except KeyboardInterrupt:
         print("\n\nInterrupted. Stopping workers...", file=sys.stderr)
         pool.terminate()
-    finally:
         pool.join()
+    except Exception as e:
+        pool.terminate()
+        pool.join()
+        raise
+    else:
+        if not found:
+            pool.close()
+            pool.join()
 
     if not found:
         elapsed = time.time() - start
@@ -216,11 +238,6 @@ def main():
         print(f"\n\nExhausted {tested:,} passwords in {elapsed:.1f}s ({rate:.1f} pw/s). Password not found.",
               file=sys.stderr)
         sys.exit(1)
-
-
-def _worker_init():
-    """Ignore SIGINT in worker processes."""
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 if __name__ == "__main__":

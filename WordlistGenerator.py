@@ -1,7 +1,8 @@
+#!/usr/bin/env python
 import itertools
 
 # 1. CONFIGURATION
-template = "#SSH0#E##"  # Your password template (use # for wildcards)
+template = "PARTIALPASSWORD"  # Your password template (use # for wildcards)
 output_file = "bitwarden_wordlist.txt"
 
 # 2. DEFINE YOUR CHARACTER STRINGS

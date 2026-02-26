@@ -81,14 +81,14 @@ Inside that folder you'll see LevelDB files like `000003.log`, `CURRENT`, `MANIF
 Use the included `extract_browser_vault.py` to dump the LevelDB into a `data.json` that BitwardenCrackle can read:
 
 ```bash
-# plyvel is included in requirements.txt / setup.sh
-
-# Extract vault data
+# No extra dependencies needed — works out of the box with raw file scanning
 python3 extract_browser_vault.py /path/to/extension/leveldb/folder
 
-# If the key structure looks off, dump all raw entries to inspect
+# If the key structure looks off, dump all extracted entries for debugging
 python3 extract_browser_vault.py /path/to/extension/leveldb/folder --dump-raw
 ```
+
+The script scans the raw `.log` and `.ldb` files for Bitwarden vault data — no extra libraries required. If `plyvel` happens to be installed it will use that for a cleaner read, but it's not needed.
 
 The script validates that the required keys (`userEmail`, `kdfIterations`, `encKey`, `encPrivateKey`) are present and warns you if anything is missing. Then use the extracted `data.json` with `brute.py` as normal.
 
